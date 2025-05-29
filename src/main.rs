@@ -1,8 +1,10 @@
 #![feature(cfg_boolean_literals)]
 #![feature(random)]
+#![feature(slice_as_chunks)]
 
 use core::f32;
 use image::{ImageBuffer, Luma};
+use rle::print_rle;
 use std::collections::HashMap;
 use std::env;
 use std::fmt::Display;
@@ -12,18 +14,17 @@ use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Instant;
 
+mod beaver;
 mod rle;
 mod types;
 
+use beaver::Beaver;
+use beaver::Progress;
 use types::*;
 
 struct Tape {
     left: Vec<Bin>,
     right: Vec<Bin>,
-}
-
-fn signed_shift(x: CacheBucket, shift: i8) -> CacheBucket {
-    if shift < 0 { x << shift } else { x >> shift }
 }
 
 impl Tape {
@@ -43,36 +44,29 @@ impl Tape {
     }
 
     fn get(&self, i: i32) -> u8 {
-        let side = if i < 0 { &self.left } else { &self.right };
-        let index = if i < 0 {
-            (i.abs() - 1) as usize
-        } else {
-            i as usize
-        };
-        let bin = index / SIZE;
-        let bit = index % SIZE;
+        let s = SIZE as i32;
+        let bin = if i < 0 { (i + 1) / s - 1 } else { i / s };
+        let bit = i.rem_euclid(s);
+        let side = if bin < 0 { &self.left } else { &self.right };
 
+        let bin = if bin < 0 { -bin - 1 } else { bin } as usize;
         if bin >= side.len() {
             return 0;
         }
-
         (side[bin] >> bit) as u8 & 1
     }
 
     fn set(&mut self, i: i32, v: bool) {
-        let side = if i < 0 {
+        let s = SIZE as i32;
+        let bin = if i < 0 { (i + 1) / s - 1 } else { i / s };
+        let bit = i.rem_euclid(s);
+        let side = if bin < 0 {
             &mut self.left
         } else {
             &mut self.right
         };
-        let index = if i < 0 {
-            (i.abs() - 1) as usize
-        } else {
-            i as usize
-        };
-        let bin = index / SIZE;
-        let bit = index % SIZE;
 
+        let bin = if bin < 0 { -bin - 1 } else { bin } as usize;
         while bin >= side.len() {
             side.push(0);
         }
@@ -125,13 +119,35 @@ impl Tape {
             return 0;
         }
     }
+
+    fn get_strings(&self, pos: i32) -> (String, String) {
+        let mut left_str = String::new();
+        let mut right_str = String::new();
+
+        let left_extent = self.left.len() * SIZE;
+        let right_extent = self.right.len() * SIZE;
+
+        for i in (-(left_extent as isize)..pos as isize).rev() {
+            let bit = self.get(i as i32);
+            left_str.push(if bit == 0 { '0' } else { '1' });
+        }
+        for i in pos as isize..right_extent as isize {
+            let bit = self.get(i as i32);
+            right_str.push(if bit == 0 { '0' } else { '1' });
+        }
+
+        (
+            left_str.trim_end_matches('0').to_string(),
+            right_str.trim_end_matches('0').to_string(),
+        )
+    }
 }
 
 impl Display for Tape {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for i in (0..self.left.len()).rev() {
             for j in 0..SIZE {
-                write!(f, "{}", (self.left[i] >> (SIZE - j - 1)) & 1)?;
+                write!(f, "{}", (self.left[i] >> j) & 1)?;
             }
         }
         write!(f, " ")?;
@@ -144,256 +160,16 @@ impl Display for Tape {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct Transition(u8);
-impl Transition {
-    fn from_str(s: &str) -> Self {
-        let s = s.as_bytes();
-        if s[0] == b'-' {
-            return Transition(0xff);
-        }
-        let write = (s[0] == b'1') as u8;
-        let step = (s[1] == b'R') as u8;
-        let next_state = s[2] - b'A';
-        Transition(write | (step << 1) | (next_state << 2))
-    }
-
-    fn write(self) -> bool {
-        self.0 & 1 > 0
-    }
-
-    fn step(self) -> i8 {
-        (self.0 & 2) as i8 - 1
-    }
-
-    fn next_state(self) -> u8 {
-        (self.0 & 0b01111100) >> 2
-    }
-}
-
-struct CacheResult {
-    steps: u16,
-    new_tape: CacheBucket,
-    offset: i8,
-    new_state: u8,
-}
-
-struct Beaver {
-    state: u8,
-    cache: Vec<HashMap<CacheBucket, CacheResult>>,
-    position: i32,
-    transitions: Vec<[Transition; 2]>,
-    tape: Tape,
-    row: u32,
-}
-
-enum Progress {
-    Halted(u16),
-    DidNotHalt(u16),
-}
-
-const MAX_CACHED_STEPS: u16 = u16::MAX;
-
-impl Beaver {
-    fn new(rule: &String) -> Self {
-        let mut transitions = Vec::new();
-        let mut cache = Vec::new();
-        for t in rule.split("_") {
-            let (left, right) = t.split_at(3);
-            transitions.push([Transition::from_str(left), Transition::from_str(right)]);
-            cache.push(HashMap::new()); // one cache per state
-        }
-        Self {
-            cache: cache,
-            state: 0,
-            position: 0,
-            transitions: transitions,
-            tape: Tape::new(),
-            row: 0,
-        }
-    }
-
-    fn step(&mut self) -> bool {
-        let side = if self.position < 0 {
-            &mut self.tape.left
-        } else {
-            &mut self.tape.right
-        };
-
-        let pos = if self.position < 0 {
-            (self.position.abs() - 1) as usize
-        } else {
-            self.position as usize
-        };
-
-        let bin = pos / SIZE;
-        let bit = pos % SIZE;
-
-        if bin >= side.len() {
-            side.push(0);
-        }
-
-        let tape_state = (side[bin] >> bit) & 1;
-        let transition = self.transitions[self.state as usize][tape_state as usize];
-
-        if transition.0 == 0xff {
-            return false;
-        } else {
-            self.state = transition.next_state();
-        }
-
-        if transition.write() {
-            side[bin] |= 1 << bit;
-        } else {
-            side[bin] &= !(1 << bit);
-        }
-
-        self.position += transition.step() as i32;
-
-        true
-    }
-
-    fn step_with_cache(&mut self) -> Progress {
-        // get neighborhood
-        let n = self.tape.get_neighborhood(self.position);
-        // check cache
-        if let Some(cached) = self.cache[self.state as usize].get(&n) {
-            // println!("cache hit");
-            // println!("  advancing {} steps", cached.steps);
-            // println!(
-            //     "  moving from {} to {}",
-            //     self.position,
-            //     self.position + cached.offset as i64
-            // );
-            // println!("  old_tape: {:016b}", n);
-            // println!("  new_tape: {:08b}", cached.new_tape);
-            // println!("  offset: {}", cached.offset);
-            // println!("  new_state: {}", cached.new_state);
-
-            let l_pos = self.position - CACHE_BUCKET_HALF_SIZE as i32;
-
-            for i in 0..CACHE_BUCKET_SIZE {
-                // println!(
-                //     "    setting {} to {}",
-                //     l_pos + i,
-                //     (cached.new_tape >> i) & 1 > 0
-                // );
-                self.tape
-                    .set(l_pos + i as i32, (cached.new_tape >> i) & 1 > 0);
-            }
-            self.position += cached.offset as i32;
-            self.state = cached.new_state;
-            return Progress::DidNotHalt(cached.steps);
-        } else {
-            // run normally until we leave the neighborhood
-            let mut steps = 0;
-            let start_pos = self.position;
-            let start_state = self.state;
-            while self.position.abs_diff(start_pos) < CACHE_BUCKET_SIZE as u32 / 2
-                && steps < MAX_CACHED_STEPS
-            {
-                // println!("  [{}] self.position: {}", steps, self.position);
-                if self.step() {
-                    steps += 1;
-                } else {
-                    // halted
-                    return Progress::Halted(steps);
-                }
-            }
-            let mut new_tape = 0;
-            let l_pos = start_pos - CACHE_BUCKET_HALF_SIZE as i32;
-
-            for i in 0..CACHE_BUCKET_SIZE {
-                if self.tape.get(l_pos + i as i32) > 0 {
-                    new_tape |= 1 << i;
-                }
-            }
-            // cache the result
-            // println!("cache miss, inserting");
-            // println!("  steps: {}", steps);
-            // println!("  old_tape: {:016b}", n);
-            // println!("  new_tape: {:08b}", new_tape);
-            // println!("  offset: {}", (self.position - start_pos) as i8);
-            // println!("  new_state: {}", self.state);
-            self.cache[start_state as usize].insert(
-                n,
-                CacheResult {
-                    steps: steps,
-                    new_tape: new_tape,
-                    offset: (self.position - start_pos) as i8,
-                    new_state: self.state,
-                },
-            );
-            return Progress::DidNotHalt(steps);
-        }
-    }
-
-    #[allow(unused)]
-    fn draw(&mut self, img: &mut ImageBuffer<Luma<u8>, Vec<u8>>) -> bool {
-        if self.row >= img.height() {
-            return false;
-        }
-
-        let halfw = img.width() / 2;
-        for x in 0..halfw - 1 {
-            let bin = x / SIZE as u32;
-            let bit = x % SIZE as u32;
-            if bin >= self.tape.right.len() as u32 {
-                break;
-            }
-            img.put_pixel(
-                x + halfw,
-                self.row,
-                Luma([(((self.tape.right[bin as usize] >> bit) as u8) & 1) * 255]),
-            );
-        }
-
-        for x in 0..halfw - 2 {
-            let bin = x / SIZE as u32;
-            let bit = x % SIZE as u32;
-            if bin >= self.tape.left.len() as u32 {
-                break;
-            }
-            img.put_pixel(
-                halfw - x - 1,
-                self.row,
-                Luma([(((self.tape.left[bin as usize] >> bit) as u8) & 1) * 255]),
-            )
-        }
-
-        self.row += 1;
-
-        true
-    }
-
-    #[allow(unused)]
-    fn draw_centered(&mut self, img: &mut ImageBuffer<Luma<u8>, Vec<u8>>) -> bool {
-        if self.row >= img.height() {
-            return false;
-        };
-
-        let halfw = img.width() as i32 / 2;
-        let pos = self.position;
-
-        for x in 0..img.width() {
-            // let col = self.tape.get(x as i64 - halfw) * 255;
-            let col = self.tape.get(pos - halfw + x as i32) * 255;
-            img.put_pixel(x, self.row, Luma([col]));
-        }
-
-        self.row += 1;
-
-        true
-    }
-}
-
 use rayon::prelude::*;
 
+mod digits;
+use digits::*;
+
 fn main() {
-    for i in -32..=32i16 {
-        // println!("{}: {}", i, i.rem_euclid(16));
-        println!("  {}: {:016b}", i, 0b0000000100000000u16 << i)
-    }
+    // for i in -32..=32i16 {
+    //     // println!("{}: {}", i, i.rem_euclid(16));
+    //     println!("  {}: {:016b}", i, 0b0000000100000000u16 << i)
+    // }
 
     let args = env::args().collect::<Vec<_>>();
     let holdouts = read_to_string(args.get(1).expect("missing holdouts file"))
@@ -406,18 +182,118 @@ fn main() {
         .parse::<u64>()
         .expect("max_steps must be an integer");
 
+    // const w: u32 = 128;
+    // const h: u32 = 512;
+    // for (i, holdout) in holdouts.iter().take(25).enumerate() {
+    //     draw(holdout, w, h, 0, format!("out_{:03}.png", i));
+    // }
+
+    // enumerate_beavers();
+    holdout_thumbnails(holdouts);
     // run_parallel(holdouts, max_steps);
-    for holdout in holdouts.iter().take(10) {
-        run_cached(holdout, max_steps);
-    }
-    // draw(holdouts[0], max_steps);
+    // for holdout in holdouts.iter().take(100) {
+    //     run_cached(holdout, max_steps);
+    // }
+    // rle_test2(holdouts);
 }
 
 #[allow(unused)]
-fn draw(holdout: &str, max_steps: u64) {
+fn holdout_thumbnails(holdouts: Vec<&str>) {
+    const OUT_DIR: &str = "out/thumbs";
+
+    const BORDER: u32 = 1;
+    const NUM_PAGES: u32 = 50;
+    const TW: u32 = 240;
+    const TH: u32 = 128;
+    const SKIP: u32 = 100;
+    const W: u32 = 2460;
+    const H: u32 = 1340;
+    const NX: u32 = W / (TW + BORDER);
+    const NY: u32 = H / (TH + BORDER);
+    const THUMBS_PER_PAGE: u32 = NX * NY;
+    println!("{}x{} grid, {}x{} thumbnails", NX, NY, TW, TH);
+    // clear output directory
+    std::fs::remove_dir_all(OUT_DIR).ok();
+    std::fs::create_dir_all(OUT_DIR).expect("Failed to create output directory");
+
+    let digits = digits::load_digits();
+
+    let t0 = Instant::now();
+    for page in 0..NUM_PAGES {
+        let mut grid = image::ImageBuffer::from_pixel(NX * TW - 1, NY * TH - 1, Luma([128u8]));
+        for y in 0..NY {
+            for x in 0..NX {
+                let i = page * THUMBS_PER_PAGE + y * NX + x;
+                if i >= holdouts.len() as u32 {
+                    break;
+                }
+                let holdout = holdouts[i as usize];
+                let thumb = Beaver::from_string(&holdout.to_string()).thumbnail(TW, TH, SKIP);
+
+                let offset_x = (x * (TW + BORDER)) as i64;
+                let offset_y = (y * (TH + BORDER)) as i64;
+                image::imageops::overlay(&mut grid, &thumb, offset_x, offset_y);
+
+                for (k, digit) in i.to_string().chars().enumerate() {
+                    let digit = digits
+                        .get((digit as u8 - b'0') as usize)
+                        .expect("Invalid digit");
+                    image::imageops::overlay(
+                        &mut grid,
+                        digit,
+                        1 + offset_x + k as i64 * 4 * digits::SCALE as i64,
+                        1 + offset_y,
+                    );
+                }
+            }
+        }
+        let index = page * THUMBS_PER_PAGE;
+        grid.save(format!("{OUT_DIR}/beavers_{:03}.png", index))
+            .expect("Failed to save grid image");
+    }
+
+    let elapsed = t0.elapsed().as_secs_f32();
+    println!(
+        "Generated {} pages of thumbnails in {:.2}s",
+        NUM_PAGES, elapsed
+    );
+    println!("  {} pages per sec", NUM_PAGES as f32 / elapsed);
+    println!(
+        "  {} thumbs per sec",
+        (THUMBS_PER_PAGE * NUM_PAGES) as f32 / elapsed
+    );
+}
+
+#[allow(unused)]
+fn enumerate_beavers() {
+    let mut beavers = Beaver::enumerate(3);
+    println!("enumerated {} beavers", beavers.len());
+    let max_steps = 10;
+    for (i, b) in beavers.iter_mut().enumerate() {
+        // println!("{}: {}", i, b.get_rule());
+        // b.thumbnail(32, 128, format!("beaver_{:03}.png", i));
+        let mut count = 0;
+        let mut halted = false;
+        loop {
+            if !b.step() {
+                // println!("  halted at step {}", count);
+                halted = true;
+                break;
+            }
+            count += 1;
+            if count >= max_steps {
+                // println!("  did not halt after {} steps", count);
+                break;
+            }
+        }
+    }
+}
+
+#[allow(unused)]
+fn draw(holdout: &str, w: u32, h: u32, skip: u64, fname: String) {
     println!("holdout: {:?}", holdout);
-    let mut b = Beaver::new(&holdout.to_string());
-    let mut img = image::GrayImage::new(1024, 1024);
+    let mut b = Beaver::from_string(&holdout.to_string());
+    let mut img = image::GrayImage::new(w, h);
     let max_steps = 10000000u64;
     let mut count = 0u64;
     loop {
@@ -427,16 +303,16 @@ fn draw(holdout: &str, max_steps: u64) {
             break;
         }
 
-        if !b.step() || count >= max_steps {
-            println!("halted at step {}", count);
+        if !b.step() || count >= h as u64 {
+            // println!("halted at step {}", count);
             break;
         }
     }
-    img.save("out.png").unwrap();
+    img.save(fname).unwrap();
 }
 
 fn run_cached(holdout: &str, max_steps: u64) {
-    let mut b = Beaver::new(&holdout.to_string());
+    let mut b = Beaver::from_string(&holdout.to_string());
     let mut steps = 0u64;
     let mut halted = true;
 
@@ -459,17 +335,17 @@ fn run_cached(holdout: &str, max_steps: u64) {
         }
     }
 
-    if halted {
-        println!("halted at step {}", steps);
-    } else {
-        println!("did not halt after {} steps", steps);
-    }
-    println!(
-        "simulated {} steps in {:.2}s ({} steps/sec)",
-        steps,
-        t0.elapsed().as_secs_f32(),
-        steps as f32 / t0.elapsed().as_secs_f32()
+    let elapsed = t0.elapsed().as_secs_f32();
+    print!("holdout: {:?} ", holdout);
+    print!(
+        "{: >7.2} M steps/sec ",
+        steps as f32 / 1_000_000.0 / elapsed
     );
+    if halted {
+        println!("(halted at step {})", steps);
+    } else {
+        println!("(did not halt after {} steps) ", steps);
+    }
 }
 
 #[allow(unused)]
@@ -480,7 +356,7 @@ fn run_parallel(holdouts: Vec<&str>, max_steps: u64) {
     holdouts.par_iter().for_each(|holdout| {
         // println!("holdout: {:?}", holdout);
 
-        let mut b = Beaver::new(&holdout.to_string());
+        let mut b = Beaver::from_string(&holdout.to_string());
         let mut step = 0;
         while b.step() {
             step += 1;
@@ -510,9 +386,8 @@ fn experiment() {
     // let mut b = Beaver::new("1RB0LD_1RC0RA_1RD0RF_1LE1LA_1RA1LE_0RB---".to_string()); // bb6 antihydra
     // let mut b = Beaver::new("1RB---_1LC1RA_1RD1LC_1LF1RE_1RC0RD_0LB0LF".to_string());
     // let mut b = Beaver::new("1RB0LD_0RC0RD_1RD0LA_1RE1RE_1LF1RB_1RZ1LG_1LC1LE".to_string());
-    let mut b = Beaver::new(&"1RB1RG_1RC0RB_1RD0RE_1RE0LD_1LF1RA_---1LD_1LC1RG".to_string());
-
-    println!("{:?}", b.transitions);
+    let mut b =
+        Beaver::from_string(&"1RB1RG_1RC0RB_1RD0RE_1RE0LD_1LF1RA_---1LD_1LC1RG".to_string());
 
     // let mut img = image::GrayImage::new(256, 512);
     let mut img = image::GrayImage::new(1024, 1024);
@@ -546,7 +421,7 @@ fn experiment() {
 
     img.save("out.png").unwrap();
 
-    println!("position: {}", b.position);
+    // println!("position: {}", b.position);
     println!(
         "{} steps in {:.2}s. {:.2} steps/s",
         count,
@@ -561,7 +436,7 @@ fn experiment() {
 }
 
 #[allow(unused)]
-fn rle_test() {
+fn rle_test(holdouts: Vec<&str>) {
     const N: usize = 100000;
     let mut data = vec![0u8; N];
     for i in 0..N {
@@ -588,6 +463,29 @@ fn rle_test() {
 }
 
 #[allow(unused)]
+fn rle_test2(holdouts: Vec<&str>) {
+    let holdout = holdouts[0];
+    println!("holdout: {:?}", holdout);
+    let mut b = Beaver::from_string(&holdout.to_string());
+    for i in 0..100000 {
+        if !b.step() {
+            println!("halted at step {}", i);
+            break;
+        }
+    }
+
+    let (l, r) = b.get_tape_strings();
+    println!("beaver: {}", b.tape);
+    println!("left: {}", l);
+    println!("right: {}", r);
+
+    print!("left RLE: ");
+    print_rle(rle::rle(l.as_bytes()));
+    print!("right RLE: ");
+    print_rle(rle::rle(r.as_bytes()));
+}
+
+#[allow(unused)]
 fn rle_bits_test() {
     const N: usize = 6;
     const NUM_BINS: usize = (N - 1) / SIZE + 1;
@@ -604,25 +502,4 @@ fn rle_bits_test() {
     let t0 = Instant::now();
     // let res = rle::rle_bits(&data.to_vec(), N);
     let elapsed = t0.elapsed().as_secs_f32();
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn test_get_neighborhood2() {
-        let mut b = Beaver::new(&"1RB1LE_0LC1LG_0LD1RD_1RC1LA_1LF0RE_0LD1LB_---0LA".to_string());
-        for _ in 0..1000 {
-            b.step();
-        }
-        println!("{}", b.tape);
-        println!("position: {}", b.position);
-        let n = b.tape.get_neighborhood2(b.position);
-        println!("neighborhood1: {:016b}", n);
-        b.position = 7;
-        let n = b.tape.get_neighborhood2(b.position);
-        println!("neighborhood2: {:016b}", n);
-        assert!(false);
-    }
 }

@@ -25,11 +25,11 @@ pub fn rle(s: &[u8]) -> Vec<(usize, &[u8])> {
                 best_chunk = chunk;
                 if chunk_size > best_best {
                     best_best = chunk_size;
-                    println!(
-                        "best chunk: {} ({})",
-                        String::from_utf8_lossy(chunk),
-                        chunk_size
-                    );
+                    // println!(
+                    //     "best chunk: {} ({})",
+                    //     String::from_utf8_lossy(chunk),
+                    //     chunk_size
+                    // );
                 }
             }
         }

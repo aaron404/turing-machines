@@ -5,4 +5,7 @@ edition = "2024"
 
 [dependencies]
 image = "0.25.6"
+itertools = "0.14.0"
 rayon = "1.10.0"
+strum = { version = "0.27.1", features = ["strum_macros"] }
+strum_macros = "0.27.1"
